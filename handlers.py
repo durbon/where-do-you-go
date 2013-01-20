@@ -1,3 +1,8 @@
+import os
+os.environ['DJANGO_SETTINGS_MODULE'] = 'settings'
+from google.appengine.dist import use_library
+use_library('django', '1.0')
+
 import wsgiref.handlers
 from google.appengine.ext import webapp
 from google.appengine.ext import db
@@ -8,19 +13,17 @@ from google.appengine.api.labs import taskqueue
 from google.appengine.api.urlfetch import DownloadError
 from google.appengine.runtime import DeadlineExceededError
 from django.utils import simplejson as json
-import os
 from os import environ
 import urllib
 import logging
 import time
-import oauth
-import foursquare
+import foursquarev2 as foursquare
 import constants
 import time
 from datetime import datetime
-from scripts import fetch_foursquare_data
+from scripts import manage_foursquare_data
 from gheatae import color_scheme, tile, provider
-from models import UserInfo, UserVenue, MapImage, AppToken
+from models import UserInfo, UserVenue, MapImage
 
 class IndexHandler(webapp.RequestHandler):
   def get(self):
@@ -42,22 +45,16 @@ class IndexHandler(webapp.RequestHandler):
       'zoom': constants.default_zoom,
       'width': constants.default_dimension,
       'height': constants.default_dimension,
+      'domain': environ['HTTP_HOST'],
+      'static_url': 'http://maps.google.com/maps/api/staticmap?center=40.7427050566%2C-73.9888000488&format=png&zoom=13&key=ABQIAAAAwA6oEsCLgzz6I150wm3ELBQO7aMTgd18mR6eRdj9blrVCeGU7BS14EnkGH_2LpNpZ8DJW0u7G5ocLQ&sensor=false&size=640x640',
+      'mapimage_url': 'map/%s.png' % 'ag93aGVyZS1kby15b3UtZ29yEQsSCE1hcEltYWdlGNL0_wIM',
     }
-    foursquare_is_happy = True
     user = users.get_current_user()
     if user:
       welcome_data['user'] = user
       welcome_data['url'] = users.create_logout_url(self.request.uri)
-      userinfo = UserInfo.all().filter('user =', user).order('-created').get()
+      userinfo = UserInfo.all().filter('user =', user).get()
       if userinfo:
-        if userinfo.is_authorized:
-          try:
-            fetch_foursquare_data.update_user_info(userinfo)
-          except foursquare.FoursquareRemoteException, err:
-            if str(err).find('403 Forbidden') >= 0:
-              foursquare_is_happy = False
-            else:
-              raise err
         welcome_data['userinfo'] = userinfo
         welcome_data['real_name'] = userinfo.real_name
         welcome_data['photo_url'] = userinfo.photo_url
@@ -66,42 +63,43 @@ class IndexHandler(webapp.RequestHandler):
         map_data['citylat'] = userinfo.citylat
         map_data['citylng'] = userinfo.citylng
     os_path = os.path.dirname(__file__)
-    self.response.out.write(template.render(os.path.join(os_path, 'templates/header.html'), {'key': constants.get_google_maps_apikey()}))
+    self.response.out.write(template.render(os.path.join(os_path, 'templates/all_header.html'), {'key': constants.get_google_maps_apikey()}))
     self.response.out.write(template.render(os.path.join(os_path, 'templates/private_welcome.html'), welcome_data))
-    if not foursquare_is_happy:
-        self.response.out.write(template.render(os.path.join(os_path, 'templates/private_forbidden.html'), None))
-    elif user and userinfo:
-      if userinfo.is_authorized:
+    if user and userinfo:
+      if userinfo.has_been_cleared:
+        self.response.out.write(template.render(os.path.join(os_path, 'templates/information.html'), {'user': user, 'has_been_cleared': userinfo.has_been_cleared}))
+      elif userinfo.is_authorized:
         self.response.out.write(template.render(os.path.join(os_path, 'templates/private_sidebar.html'), sidebar_data))
       else:
         self.response.out.write(template.render(os.path.join(os_path, 'templates/private_unauthorized.html'), None))
     else:
-        self.response.out.write(template.render(os.path.join(os_path, 'templates/information.html'), {'user': user }))
+      self.response.out.write(template.render(os.path.join(os_path, 'templates/information.html'), {'user': user, 'has_been_cleared': False}))
     self.response.out.write(template.render(os.path.join(os_path, 'templates/private_map.html'), map_data))
     self.response.out.write(template.render(os.path.join(os_path, 'templates/all_footer.html'), None))
 
+class InformationWriter(webapp.RequestHandler): #NOTE this defaults to the has_been_cleared case for now, since that's the only one that's used
+  def get(self):
+    user = users.get_current_user()
+    os_path = os.path.dirname(__file__)
+    self.response.out.write(template.render(os.path.join(os_path, 'templates/information.html'), {'user': user, 'has_been_cleared': True}))
+
 class AuthHandler(webapp.RequestHandler):
+  def _get_new_fs_and_credentials(self):
+    consumer_key, oauth_secret, url = constants.get_oauth_strings()
+    fs = foursquare.FoursquareAuthHelper(key=consumer_key, secret=oauth_secret, redirect_uri=url)
+    return fs, None
+    
   def get(self):
     user = users.get_current_user()
     if user:
-      oauth_token = self.request.get("oauth_token")
-
-      def get_new_fs_and_credentials():
-        oauth_token, oauth_secret = constants.get_oauth_strings()
-        credentials = foursquare.OAuthCredentials(oauth_token, oauth_secret)
-        fs = foursquare.Foursquare(credentials)
-        return fs, credentials
-
-      if oauth_token:
+      code = self.request.get("code")
+      if code:
         old_userinfos = UserInfo.all().filter('user =', user).fetch(500)
         db.delete(old_userinfos)
-        fs, credentials = get_new_fs_and_credentials()
-        apptoken = AppToken.all().filter('token =', oauth_token).get()
-        
+        fs, credentials = self._get_new_fs_and_credentials()
         try:
-          user_token = fs.access_token(oauth.OAuthToken(apptoken.token, apptoken.secret))
-          credentials.set_access_token(user_token)
-          userinfo = UserInfo(user = user, token = credentials.access_token.key, secret = credentials.access_token.secret, is_ready=False, is_authorized=True, last_checkin=0, last_updated=datetime.now(), color_scheme='fire', level_max=int(constants.level_const), checkin_count=0, venue_count=0)
+          user_token = fs.get_access_token(code)
+          userinfo = UserInfo(user = user, token = user_token, secret = None, is_ready=False, is_authorized=True, level_max=int(3 * constants.level_const))
         except DownloadError, err:
           if str(err).find('ApplicationError: 5') >= 0:
             pass # if something bad happens on OAuth, then it currently just redirects to the signup page
@@ -109,9 +107,8 @@ class AuthHandler(webapp.RequestHandler):
           else:
             raise err
         try:
-          fetch_foursquare_data.update_user_info(userinfo)
-          fetch_foursquare_data.fetch_and_store_checkins(userinfo, limit=10)
-          taskqueue.add(url='/fetch_foursquare_data/all_for_user/%s' % userinfo.key())
+          manage_foursquare_data.update_user_info(userinfo)
+          manage_foursquare_data.fetch_and_store_checkins_next(userinfo, limit=50)
         except foursquare.FoursquareRemoteException, err:
           if str(err).find('403 Forbidden') >= 0:
             pass # if a user tries to sign up while my app is blocked, then it currently just redirects to the signup page
@@ -122,12 +119,8 @@ class AuthHandler(webapp.RequestHandler):
           pass #TODO make this better, but I'd rather throw the user back to the main page to try again than show the user an error.
         self.redirect("/")
       else:
-        fs, credentials = get_new_fs_and_credentials()
-        app_token = fs.request_token()
-        auth_url = fs.authorize(app_token)
-        new_apptoken = AppToken(token = app_token.key, secret = app_token.secret)
-        new_apptoken.put()
-        self.redirect(auth_url)
+        fs, credentials = self._get_new_fs_and_credentials()
+        self.redirect(fs.get_authentication_url())
     else:
       self.redirect(users.create_login_url(self.request.uri))
 
@@ -176,7 +169,6 @@ class TileHandler(webapp.RequestHandler):
       else:
         self.respondError("Invalid path")
         return
-
       start = datetime.now()
       try:
         new_tile = tile.GoogleTile(user, zoom, x, y)
@@ -217,34 +209,19 @@ class PublicPageHandler(webapp.RequestHandler):
         'static_url': mapimage.static_url,
         'mapimage_url': 'map/%s.png' % mapimage.key(),
       }
-      userinfo = UserInfo.all().filter('user =', mapimage.user).order('-created').get()
+      userinfo = UserInfo.all().filter('user =', mapimage.user).get()
       if userinfo:
         welcome_data['real_name'] = userinfo.real_name
         welcome_data['photo_url'] = userinfo.photo_url
         #welcome_data['checkin_count'] = userinfo.checkin_count
       os_path = os.path.dirname(__file__)
-      self.response.out.write(template.render(os.path.join(os_path, 'templates/header.html'), None))
+      self.response.out.write(template.render(os.path.join(os_path, 'templates/all_header.html'), None))
       self.response.out.write(template.render(os.path.join(os_path, 'templates/public_welcome.html'), welcome_data))
       self.response.out.write(template.render(os.path.join(os_path, 'templates/public_sidebar.html'), sidebar_data))
       self.response.out.write(template.render(os.path.join(os_path, 'templates/public_map.html'), map_data))
       self.response.out.write(template.render(os.path.join(os_path, 'templates/all_footer.html'), None))
     else:
       self.redirect("/")
-
-class UserVenueWriter(webapp.RequestHandler):
-  def get(self):
-    user = users.get_current_user()
-    if user:
-      userinfo = UserInfo.all().filter('user =', user).order('-created').get()
-      if userinfo:
-          self.response.out.write(str(userinfo))
-      usevenues = constants.provider.get_user_data(user=user)
-      if not uservenue.checkin_guid_list or len(uservenue.checkin_guid_list) is 0:
-        uservenue.checkin_guid_list = [str(checkin_id) for checkin_id in uservenue.checkin_list]
-        usevenue.put()
-      template_data = { 'uservenues': usevenues}
-      os_path = os.path.dirname(__file__)
-      self.response.out.write(template.render(os.path.join(os_path, 'templates/uservenue_list.html'), template_data))
 
 class StaticMapHtmlWriter(webapp.RequestHandler):
   def get(self):
@@ -264,15 +241,25 @@ class StaticMapHtmlWriter(webapp.RequestHandler):
       else:
         self.response.out.write("")
 
-class ReadyInfoWriter(webapp.RequestHandler):
+class UserReadyEndpoint(webapp.RequestHandler):
   def get(self):
     user = users.get_current_user()
     if user:
-      userinfo = UserInfo.all().filter('user =', user).get() #.order('-created')
+      userinfo = UserInfo.all().filter('user =', user).get()
       if userinfo:
-          self.response.out.write(str(userinfo.is_ready) + ',' + str(userinfo.checkin_count))
-          return
-    self.response.out.write("")
+        self.response.out.write(str(userinfo.has_been_cleared) + ',' + str(userinfo.is_ready) + ',' + str(userinfo.checkin_count))
+        return
+    self.response.out.write('error')
+
+class MapDoneEndpoint(webapp.RequestHandler):
+  def get(self):
+    user = users.get_current_user()
+    if user:
+      mapimage = MapImage.all().filter('user =', user).get()
+      if mapimage:
+        self.response.out.write(str(mapimage.tiles_remaining == 0))
+        return
+    self.response.out.write('error')
 
 def main():
   application = webapp.WSGIApplication([('/', IndexHandler),
@@ -281,9 +268,10 @@ def main():
                                         ('/tile/.*', TileHandler),
                                         ('/map/.*', StaticMapHandler),
                                         ('/public/.*', PublicPageHandler),
+                                        ('/information', InformationWriter),
                                         ('/static_map_html', StaticMapHtmlWriter),
-                                        ('/user_is_ready', ReadyInfoWriter),
-                                        ('/view_uservenues', UserVenueWriter)],
+                                        ('/user_is_ready/.*', UserReadyEndpoint),
+                                        ('/map_is_done/', MapDoneEndpoint)],
                                       debug=True)
   constants.provider = provider.DBProvider()
   wsgiref.handlers.CGIHandler().run(application)

@@ -1,10 +1,9 @@
 import oauth_secrets #NOTE this file is not included in the repository because it contains the OAuth consumer secrets
 from os import environ
 from gheatae import color_scheme
-import foursquare
 import logging
 
-min_zoom = 10
+min_zoom = 3
 max_zoom = 18 # note that these must also be in the static wdyg-private.js file
 
 level_const = 140. #TODO fix this from being hard coded in models.py for UserInfo - I was getting a <type 'exceptions.AttributeError'>: 'module' object has no attribute 'level_const'
@@ -32,7 +31,7 @@ def get_google_maps_apikey():
   else:
     logging.error('No Google maps key found for domain ' + domain)
 
-def get_oauth_strings(force_primary_domain=True):
+def get_oauth_strings(force_primary_domain=False):
   if force_primary_domain: # I was getting SIGNATURE_INVALID oauth errors on many of my backend calls because 
                            # I was not using the same domain for the requests as I was when the users signed up
                            # Always forcing this will break support for other domains, but will fix some OAuth
@@ -40,6 +39,8 @@ def get_oauth_strings(force_primary_domain=True):
       domain = 'www.wheredoyougo.net'
   else:
       domain = environ['HTTP_HOST']
+  logging.info('-------------------------------')
+  logging.info(domain)
   if domain == 'www.wheredoyougo.net':
     consumer_key = 'KTNXGQJ4JXDZGAG35MGZ3WN0EQIO5XHNALYQZATHVEPDR3TI'
     callback_url = 'http://www.wheredoyougo.net/authenticated'
@@ -53,6 +54,6 @@ def get_oauth_strings(force_primary_domain=True):
     consumer_key = ''
     callback_url = ''
     logging.error('No Foursquare OAuth consumer key found for domain ' + domain)
-  return consumer_key, oauth_secrets.get_oauth_consumer_secret_for_domain(domain)#, callback_url)
+  return consumer_key, oauth_secrets.get_oauth_consumer_secret_for_domain(domain), callback_url
 
 provider = None
